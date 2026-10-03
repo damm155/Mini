@@ -13,7 +13,6 @@ on:
 
 env:
   JAVA_VERSION: '17'
-  GRADLE_VERSION: '8.11.1'
   NDK_VERSION: '28.0.12433566'
   GO_VERSION: '1.25.0'
   COMPILE_SDK: '36'
@@ -24,8 +23,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          submodules: recursive
 
       - name: Set up JDK
         uses: actions/setup-java@v4
@@ -35,13 +32,21 @@ jobs:
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
-        with:
-          packages: |
-            platform-tools
-            platforms;android-${{ env.COMPILE_SDK }}
-            build-tools;35.0.0
-            ndk;${{ env.NDK_VERSION }}
-            cmake;3.22.1
+
+      - name: Install Android SDK components
+        shell: bash
+        run: |
+          set -euxo pipefail
+          export ANDROID_HOME="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          export ANDROID_SDK_ROOT="${ANDROID_SDK_ROOT:-$ANDROID_HOME}"
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+          sdkmanager --install \
+            "platform-tools" \
+            "platforms;android-${COMPILE_SDK}" \
+            "build-tools;35.0.0" \
+            "ndk;${NDK_VERSION}" \
+            "cmake;3.22.1"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -50,9 +55,10 @@ jobs:
 
       - name: Install gomobile
         run: |
+          set -eux
           go install golang.org/x/mobile/cmd/gomobile@latest
           gomobile init
-          echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
 
       - name: Cache native build artifacts
         uses: actions/cache@v4
@@ -63,30 +69,35 @@ jobs:
             src/android/app/src/main/assets/alpine-minirootfs.tar.gz
             src/android/app/src/main/jniLibs/arm64-v8a/
             src/android/app/libs/rclone.aar
-            deps/build/
           key: native-${{ runner.os }}-ndk${{ env.NDK_VERSION }}-go${{ env.GO_VERSION }}-${{ hashFiles('deps/build_proot.sh', 'deps/build_rclone_android.sh', 'scripts/prepare_android_sandbox.sh') }}
 
       - name: Build PRoot (arm64)
         if: steps.cache-native.outputs.cache-hit != 'true'
-        env:
-          ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_ROOT }}
         run: |
+          set -eux
+          # zip 导入的仓库里子模块目录是空的（没有 gitlink），按需克隆 proot 分支仓库
+          if [ -z "$(ls -A deps/proot 2>/dev/null || true)" ]; then
+            echo "deps/proot is empty - cloning the OpenMinis fork"
+            rm -rf deps/proot
+            git clone --depth 1 https://github.com/OpenMinis/proot.git deps/proot
+          fi
           chmod +x deps/build_proot.sh
-          cd deps && ./build_proot.sh
+          ./deps/build_proot.sh
 
       - name: Build rclone AAR
         if: steps.cache-native.outputs.cache-hit != 'true'
-        env:
-          ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_ROOT }}
         run: |
+          set -eux
           chmod +x deps/build_rclone_android.sh
-          cd deps && ./build_rclone_android.sh
-          mkdir -p ../src/android/app/libs
-          cp deps/build/rclone/rclone.aar ../src/android/app/libs/
+          ./deps/build_rclone_android.sh
+          mkdir -p src/android/app/libs
+          cp deps/build/rclone/rclone.aar src/android/app/libs/
+          ls -lh src/android/app/libs/
 
       - name: Prepare Android sandbox assets
         if: steps.cache-native.outputs.cache-hit != 'true'
         run: |
+          set -eux
           chmod +x scripts/prepare_android_sandbox.sh
           ./scripts/prepare_android_sandbox.sh
 
@@ -106,8 +117,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          submodules: recursive
 
       - name: Download native artifacts
         uses: actions/download-artifact@v4
@@ -117,18 +126,26 @@ jobs:
 
       - name: Restore native artifacts
         run: |
+          set -eux
           mkdir -p src/android/app/src/main/assets/
-          mkdir -p src/android/app/src/main/jniLibs/
+          mkdir -p src/android/app/src/main/jniLibs/arm64-v8a/
           mkdir -p src/android/app/libs/
-          cp -r /tmp/native-deps/src/android/app/src/main/assets/* src/android/app/src/main/assets/ 2>/dev/null || true
-          cp -r /tmp/native-deps/src/android/app/src/main/jniLibs/* src/android/app/src/main/jniLibs/ 2>/dev/null || true
-          cp -r /tmp/native-deps/src/android/app/libs/* src/android/app/libs/ 2>/dev/null || true
+          # artifact 解压后的目录层级不固定，按文件名反查所在目录，兼容任何结构
+          ASSETS_SRC=$(find /tmp/native-deps -type f \( -name 'proot-aarch64' -o -name 'alpine-minirootfs.tar.gz' \) -printf '%h\n' | head -n1 || true)
+          JNILIBS_SRC=$(find /tmp/native-deps -type d -name 'arm64-v8a' | head -n1 || true)
+          LIBS_SRC=$(find /tmp/native-deps -type f -name 'rclone.aar' -printf '%h\n' | head -n1 || true)
+          echo "ASSETS_SRC=$ASSETS_SRC JNILIBS_SRC=$JNILIBS_SRC LIBS_SRC=$LIBS_SRC"
+          if [ -n "$ASSETS_SRC" ]; then cp -a "$ASSETS_SRC/." src/android/app/src/main/assets/; fi
+          if [ -n "$JNILIBS_SRC" ]; then cp -a "$JNILIBS_SRC/." src/android/app/src/main/jniLibs/arm64-v8a/; fi
+          if [ -n "$LIBS_SRC" ]; then cp -a "$LIBS_SRC/." src/android/app/libs/; fi
           echo "=== Assets ==="
-          ls -lh src/android/app/src/main/assets/
+          ls -lh src/android/app/src/main/assets/ || true
           echo "=== JNI Libs ==="
-          ls -lh src/android/app/src/main/jniLibs/arm64-v8a/
+          ls -lh src/android/app/src/main/jniLibs/arm64-v8a/ || true
           echo "=== Libs ==="
-          ls -lh src/android/app/libs/
+          ls -lh src/android/app/libs/ || true
+          test -f src/android/app/libs/rclone.aar
+          test -f src/android/app/src/main/assets/proot-aarch64
 
       - name: Set up JDK
         uses: actions/setup-java@v4
@@ -139,13 +156,21 @@ jobs:
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
-        with:
-          packages: |
-            platform-tools
-            platforms;android-${{ env.COMPILE_SDK }}
-            build-tools;35.0.0
-            ndk;${{ env.NDK_VERSION }}
-            cmake;3.22.1
+
+      - name: Install Android SDK components
+        shell: bash
+        run: |
+          set -euxo pipefail
+          export ANDROID_HOME="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          export ANDROID_SDK_ROOT="${ANDROID_SDK_ROOT:-$ANDROID_HOME}"
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+          sdkmanager --install \
+            "platform-tools" \
+            "platforms;android-${COMPILE_SDK}" \
+            "build-tools;35.0.0" \
+            "ndk;${NDK_VERSION}" \
+            "cmake;3.22.1"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
 
       - name: Grant execute permission for gradlew
         working-directory: src/android
@@ -154,26 +179,17 @@ jobs:
       - name: Create provider-customization.properties
         working-directory: src/android/app
         run: |
-          cp provider-customization.properties.example provider-customization.properties 2>/dev/null || touch provider-customization.properties
-          echo "Created provider-customization.properties"
+          if [ -f provider-customization.properties.example ]; then
+            cp provider-customization.properties.example provider-customization.properties
+          else
+            touch provider-customization.properties
+          fi
           cat provider-customization.properties
-
-      - name: Cache Gradle dependencies
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.gradle/caches
-            ~/.gradle/wrapper
-          key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
-          restore-keys: |
-            gradle-${{ runner.os }}-
 
       - name: Build Release APK
         working-directory: src/android
-        env:
-          ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_ROOT }}
-          JAVA_HOME: ${{ env.JAVA_HOME_17_X64 }}
         run: |
+          set -eux
           ./gradlew assembleRelease --no-daemon --stacktrace
 
       - name: Upload Release APK
@@ -188,14 +204,6 @@ jobs:
         with:
           name: release-mapping
           path: src/android/app/build/outputs/mapping/release/
-          if-no-files-found: ignore
-
-      - name: Upload Native Symbols
-        uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: native-debug-symbols
-          path: src/android/app/build/intermediates/merged_native_libs/release/*/lib/
           if-no-files-found: ignore
 
   release:
@@ -220,11 +228,11 @@ jobs:
           else
             TAG="${{ github.ref_name }}"
           fi
-          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           APK_FILE=$(ls release/*.apk | head -1)
-          echo "apk=$(basename $APK_FILE)" >> $GITHUB_OUTPUT
+          echo "apk=$(basename "$APK_FILE")" >> "$GITHUB_OUTPUT"
           echo "Tag: $TAG"
-          echo "APK: $(basename $APK_FILE)"
+          echo "APK: $(basename "$APK_FILE")"
 
       - name: Rename APK
         run: |
@@ -237,14 +245,14 @@ jobs:
           name: OpenMinis ${{ steps.version.outputs.tag }}
           body: |
             ## OpenMinis ${{ steps.version.outputs.tag }}
-            
+
             Android Release APK
-            
+
             ### Installation
             1. Download the APK below
             2. Enable "Install from unknown sources" in your device settings
             3. Install the APK
-            
+
             ### Notes
             - This is a Release build with ProGuard optimizations enabled
             - Requires Android 8.0 (API 26) or later
