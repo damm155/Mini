@@ -1,0 +1,255 @@
+name: Build Android Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v1.14). Leave empty to skip GitHub Release upload'
+        required: false
+        default: ''
+  push:
+    tags:
+      - 'v*'
+
+env:
+  JAVA_VERSION: '17'
+  GRADLE_VERSION: '8.11.1'
+  NDK_VERSION: '28.0.12433566'
+  GO_VERSION: '1.25.0'
+  COMPILE_SDK: '36'
+
+jobs:
+  build-native-deps:
+    name: Build native dependencies
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: |
+            platform-tools
+            platforms;android-${{ env.COMPILE_SDK }}
+            build-tools;35.0.0
+            ndk;${{ env.NDK_VERSION }}
+            cmake;3.22.1
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Install gomobile
+        run: |
+          go install golang.org/x/mobile/cmd/gomobile@latest
+          gomobile init
+          echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
+
+      - name: Cache native build artifacts
+        uses: actions/cache@v4
+        id: cache-native
+        with:
+          path: |
+            src/android/app/src/main/assets/proot-aarch64
+            src/android/app/src/main/assets/alpine-minirootfs.tar.gz
+            src/android/app/src/main/jniLibs/arm64-v8a/
+            src/android/app/libs/rclone.aar
+            deps/build/
+          key: native-${{ runner.os }}-ndk${{ env.NDK_VERSION }}-go${{ env.GO_VERSION }}-${{ hashFiles('deps/build_proot.sh', 'deps/build_rclone_android.sh', 'scripts/prepare_android_sandbox.sh') }}
+
+      - name: Build PRoot (arm64)
+        if: steps.cache-native.outputs.cache-hit != 'true'
+        env:
+          ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_ROOT }}
+        run: |
+          chmod +x deps/build_proot.sh
+          cd deps && ./build_proot.sh
+
+      - name: Build rclone AAR
+        if: steps.cache-native.outputs.cache-hit != 'true'
+        env:
+          ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_ROOT }}
+        run: |
+          chmod +x deps/build_rclone_android.sh
+          cd deps && ./build_rclone_android.sh
+          mkdir -p ../src/android/app/libs
+          cp deps/build/rclone/rclone.aar ../src/android/app/libs/
+
+      - name: Prepare Android sandbox assets
+        if: steps.cache-native.outputs.cache-hit != 'true'
+        run: |
+          chmod +x scripts/prepare_android_sandbox.sh
+          ./scripts/prepare_android_sandbox.sh
+
+      - name: Upload native artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-deps
+          path: |
+            src/android/app/src/main/assets/
+            src/android/app/src/main/jniLibs/
+            src/android/app/libs/
+          retention-days: 1
+
+  build-apk:
+    name: Build Release APK
+    needs: build-native-deps
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Download native artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: native-deps
+          path: /tmp/native-deps
+
+      - name: Restore native artifacts
+        run: |
+          mkdir -p src/android/app/src/main/assets/
+          mkdir -p src/android/app/src/main/jniLibs/
+          mkdir -p src/android/app/libs/
+          cp -r /tmp/native-deps/src/android/app/src/main/assets/* src/android/app/src/main/assets/ 2>/dev/null || true
+          cp -r /tmp/native-deps/src/android/app/src/main/jniLibs/* src/android/app/src/main/jniLibs/ 2>/dev/null || true
+          cp -r /tmp/native-deps/src/android/app/libs/* src/android/app/libs/ 2>/dev/null || true
+          echo "=== Assets ==="
+          ls -lh src/android/app/src/main/assets/
+          echo "=== JNI Libs ==="
+          ls -lh src/android/app/src/main/jniLibs/arm64-v8a/
+          echo "=== Libs ==="
+          ls -lh src/android/app/libs/
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: gradle
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: |
+            platform-tools
+            platforms;android-${{ env.COMPILE_SDK }}
+            build-tools;35.0.0
+            ndk;${{ env.NDK_VERSION }}
+            cmake;3.22.1
+
+      - name: Grant execute permission for gradlew
+        working-directory: src/android
+        run: chmod +x gradlew
+
+      - name: Create provider-customization.properties
+        working-directory: src/android/app
+        run: |
+          cp provider-customization.properties.example provider-customization.properties 2>/dev/null || touch provider-customization.properties
+          echo "Created provider-customization.properties"
+          cat provider-customization.properties
+
+      - name: Cache Gradle dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+          restore-keys: |
+            gradle-${{ runner.os }}-
+
+      - name: Build Release APK
+        working-directory: src/android
+        env:
+          ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_ROOT }}
+          JAVA_HOME: ${{ env.JAVA_HOME_17_X64 }}
+        run: |
+          ./gradlew assembleRelease --no-daemon --stacktrace
+
+      - name: Upload Release APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-release-apk
+          path: src/android/app/build/outputs/apk/release/*.apk
+
+      - name: Upload Release Mapping
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: release-mapping
+          path: src/android/app/build/outputs/mapping/release/
+          if-no-files-found: ignore
+
+      - name: Upload Native Symbols
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: native-debug-symbols
+          path: src/android/app/build/intermediates/merged_native_libs/release/*/lib/
+          if-no-files-found: ignore
+
+  release:
+    name: Create GitHub Release
+    needs: build-apk
+    if: github.event.inputs.tag != '' || startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download APK
+        uses: actions/download-artifact@v4
+        with:
+          name: app-release-apk
+          path: release/
+
+      - name: Get version info
+        id: version
+        run: |
+          if [ -n "${{ github.event.inputs.tag }}" ]; then
+            TAG="${{ github.event.inputs.tag }}"
+          else
+            TAG="${{ github.ref_name }}"
+          fi
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          APK_FILE=$(ls release/*.apk | head -1)
+          echo "apk=$(basename $APK_FILE)" >> $GITHUB_OUTPUT
+          echo "Tag: $TAG"
+          echo "APK: $(basename $APK_FILE)"
+
+      - name: Rename APK
+        run: |
+          mv release/*.apk "release/OpenMinis-${{ steps.version.outputs.tag }}-release.apk"
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: OpenMinis ${{ steps.version.outputs.tag }}
+          body: |
+            ## OpenMinis ${{ steps.version.outputs.tag }}
+            
+            Android Release APK
+            
+            ### Installation
+            1. Download the APK below
+            2. Enable "Install from unknown sources" in your device settings
+            3. Install the APK
+            
+            ### Notes
+            - This is a Release build with ProGuard optimizations enabled
+            - Requires Android 8.0 (API 26) or later
+            - Supports arm64-v8a architecture only
+          files: |
+            release/*.apk
+          draft: false
+          prerelease: false
