@@ -13,9 +13,11 @@ on:
 
 env:
   JAVA_VERSION: '17'
-  NDK_VERSION: '28.0.12433566'
+  NDK_VERSION: '28.0.13004108'
   GO_VERSION: '1.25.0'
   COMPILE_SDK: '36'
+  BUILD_TOOLS: '35.0.0'
+  CMAKE_VERSION: '3.22.1'
 
 jobs:
   build-native-deps:
@@ -30,23 +32,84 @@ jobs:
           distribution: temurin
           java-version: ${{ env.JAVA_VERSION }}
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-
+      # 镜像预装的 sdkmanager 可能与 Google 仓库索引不同步（报
+      # "Failed to find package 'tools'" 并以 exit code 1 退出）。
+      # 这里优先下载官方 cmdline-tools 放到 cmdline-tools/latest，
+      # 下载失败则退回镜像预装版本；所有组件装完都在磁盘上校验，
+      # 单个包的无害告警不会中断整个步骤。
       - name: Install Android SDK components
         shell: bash
         run: |
-          set -euxo pipefail
+          set -eux
           export ANDROID_HOME="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
-          export ANDROID_SDK_ROOT="${ANDROID_SDK_ROOT:-$ANDROID_HOME}"
-          yes | sdkmanager --licenses >/dev/null 2>&1 || true
-          sdkmanager --install \
+          export ANDROID_SDK_ROOT="$ANDROID_HOME"
+          if [ ! -x "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" ]; then
+            for u in \
+              "https://dl.google.com/android/repository/commandlinetools-linux-13114758_latest.zip" \
+              "https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip"
+            do
+              curl -fsSL -o /tmp/ct.zip "$u" && break || echo "::warning::cmdline-tools download failed: $u"
+            done
+            if [ -s /tmp/ct.zip ]; then
+              unzip -q -o /tmp/ct.zip -d /tmp/ct
+              mkdir -p "$ANDROID_HOME/cmdline-tools"
+              rm -rf "$ANDROID_HOME/cmdline-tools/latest"
+              mv /tmp/ct/cmdline-tools "$ANDROID_HOME/cmdline-tools/latest"
+            fi
+          fi
+          if [ -x "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" ]; then
+            SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          else
+            SDKMANAGER="$(ls -d "$ANDROID_HOME"/cmdline-tools/*/bin/sdkmanager 2>/dev/null | sort -V | tail -n1 || true)"
+            if [ -z "$SDKMANAGER" ]; then SDKMANAGER="$(command -v sdkmanager || true)"; fi
+          fi
+          if [ -z "$SDKMANAGER" ] || [ ! -x "$SDKMANAGER" ]; then
+            echo "::error::sdkmanager not found under $ANDROID_HOME"
+            exit 1
+          fi
+          echo "sdkmanager = $SDKMANAGER"
+          "$SDKMANAGER" --version || true
+          yes | "$SDKMANAGER" --sdk_root="$ANDROID_HOME" --licenses > /dev/null 2>&1 || true
+          # 刷新仓库元数据，避免索引过旧导致找不到包
+          "$SDKMANAGER" --sdk_root="$ANDROID_HOME" --update || true
+
+          for pkg in \
             "platform-tools" \
             "platforms;android-${COMPILE_SDK}" \
-            "build-tools;35.0.0" \
-            "ndk;${NDK_VERSION}" \
-            "cmake;3.22.1"
-          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
+            "platforms;android-24" \
+            "build-tools;${BUILD_TOOLS}" \
+            "cmake;${CMAKE_VERSION}"
+          do
+            "$SDKMANAGER" --sdk_root="$ANDROID_HOME" --install "$pkg" || echo "::warning::sdkmanager exited non-zero for $pkg"
+          done
+
+          # NDK：先看磁盘上有没有，再尝试安装已知 r28 版本号，最后退回任意预装 NDK
+          NDK_DIR=""
+          for v in "${NDK_VERSION}" 28.0.12433566 28.1.13356709 28.2.13676358; do
+            if [ -d "$ANDROID_HOME/ndk/$v" ]; then NDK_DIR="$ANDROID_HOME/ndk/$v"; break; fi
+          done
+          if [ -z "$NDK_DIR" ]; then
+            for v in "${NDK_VERSION}" 28.0.12433566 28.1.13356709 28.2.13676358; do
+              "$SDKMANAGER" --sdk_root="$ANDROID_HOME" --install "ndk;$v" || echo "::warning::sdkmanager exited non-zero for ndk;$v"
+              if [ -d "$ANDROID_HOME/ndk/$v" ]; then NDK_DIR="$ANDROID_HOME/ndk/$v"; break; fi
+            done
+          fi
+          if [ -z "$NDK_DIR" ]; then
+            NDK_DIR="$(ls -d "$ANDROID_HOME"/ndk/* 2>/dev/null | sort -V | tail -n1 || true)"
+          fi
+          if [ -z "$NDK_DIR" ]; then
+            echo "::error::No usable NDK found under $ANDROID_HOME/ndk"
+            exit 1
+          fi
+
+          test -d "$ANDROID_HOME/platforms/android-${COMPILE_SDK}" || { echo "::error::platform android-${COMPILE_SDK} missing"; exit 1; }
+          test -d "$ANDROID_HOME/build-tools/${BUILD_TOOLS}" || { echo "::error::build-tools ${BUILD_TOOLS} missing"; exit 1; }
+          test -d "$ANDROID_HOME/cmake/${CMAKE_VERSION}" || { echo "::error::cmake ${CMAKE_VERSION} missing"; exit 1; }
+
+          echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$ANDROID_HOME" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=$NDK_DIR" >> "$GITHUB_ENV"
+          echo "Selected NDK: $NDK_DIR"
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -154,23 +217,76 @@ jobs:
           java-version: ${{ env.JAVA_VERSION }}
           cache: gradle
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-
       - name: Install Android SDK components
         shell: bash
         run: |
-          set -euxo pipefail
+          set -eux
           export ANDROID_HOME="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
-          export ANDROID_SDK_ROOT="${ANDROID_SDK_ROOT:-$ANDROID_HOME}"
-          yes | sdkmanager --licenses >/dev/null 2>&1 || true
-          sdkmanager --install \
+          export ANDROID_SDK_ROOT="$ANDROID_HOME"
+          if [ ! -x "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" ]; then
+            for u in \
+              "https://dl.google.com/android/repository/commandlinetools-linux-13114758_latest.zip" \
+              "https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip"
+            do
+              curl -fsSL -o /tmp/ct.zip "$u" && break || echo "::warning::cmdline-tools download failed: $u"
+            done
+            if [ -s /tmp/ct.zip ]; then
+              unzip -q -o /tmp/ct.zip -d /tmp/ct
+              mkdir -p "$ANDROID_HOME/cmdline-tools"
+              rm -rf "$ANDROID_HOME/cmdline-tools/latest"
+              mv /tmp/ct/cmdline-tools "$ANDROID_HOME/cmdline-tools/latest"
+            fi
+          fi
+          if [ -x "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" ]; then
+            SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          else
+            SDKMANAGER="$(ls -d "$ANDROID_HOME"/cmdline-tools/*/bin/sdkmanager 2>/dev/null | sort -V | tail -n1 || true)"
+            if [ -z "$SDKMANAGER" ]; then SDKMANAGER="$(command -v sdkmanager || true)"; fi
+          fi
+          if [ -z "$SDKMANAGER" ] || [ ! -x "$SDKMANAGER" ]; then
+            echo "::error::sdkmanager not found under $ANDROID_HOME"
+            exit 1
+          fi
+          echo "sdkmanager = $SDKMANAGER"
+          "$SDKMANAGER" --version || true
+          yes | "$SDKMANAGER" --sdk_root="$ANDROID_HOME" --licenses > /dev/null 2>&1 || true
+          "$SDKMANAGER" --sdk_root="$ANDROID_HOME" --update || true
+
+          for pkg in \
             "platform-tools" \
             "platforms;android-${COMPILE_SDK}" \
-            "build-tools;35.0.0" \
-            "ndk;${NDK_VERSION}" \
-            "cmake;3.22.1"
-          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
+            "build-tools;${BUILD_TOOLS}" \
+            "cmake;${CMAKE_VERSION}"
+          do
+            "$SDKMANAGER" --sdk_root="$ANDROID_HOME" --install "$pkg" || echo "::warning::sdkmanager exited non-zero for $pkg"
+          done
+
+          NDK_DIR=""
+          for v in "${NDK_VERSION}" 28.0.12433566 28.1.13356709 28.2.13676358; do
+            if [ -d "$ANDROID_HOME/ndk/$v" ]; then NDK_DIR="$ANDROID_HOME/ndk/$v"; break; fi
+          done
+          if [ -z "$NDK_DIR" ]; then
+            for v in "${NDK_VERSION}" 28.0.12433566 28.1.13356709 28.2.13676358; do
+              "$SDKMANAGER" --sdk_root="$ANDROID_HOME" --install "ndk;$v" || echo "::warning::sdkmanager exited non-zero for ndk;$v"
+              if [ -d "$ANDROID_HOME/ndk/$v" ]; then NDK_DIR="$ANDROID_HOME/ndk/$v"; break; fi
+            done
+          fi
+          if [ -z "$NDK_DIR" ]; then
+            NDK_DIR="$(ls -d "$ANDROID_HOME"/ndk/* 2>/dev/null | sort -V | tail -n1 || true)"
+          fi
+          if [ -z "$NDK_DIR" ]; then
+            echo "::error::No usable NDK found under $ANDROID_HOME/ndk"
+            exit 1
+          fi
+
+          test -d "$ANDROID_HOME/platforms/android-${COMPILE_SDK}" || { echo "::error::platform android-${COMPILE_SDK} missing"; exit 1; }
+          test -d "$ANDROID_HOME/build-tools/${BUILD_TOOLS}" || { echo "::error::build-tools ${BUILD_TOOLS} missing"; exit 1; }
+          test -d "$ANDROID_HOME/cmake/${CMAKE_VERSION}" || { echo "::error::cmake ${CMAKE_VERSION} missing"; exit 1; }
+
+          echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$ANDROID_HOME" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=$NDK_DIR" >> "$GITHUB_ENV"
+          echo "Selected NDK: $NDK_DIR"
 
       - name: Grant execute permission for gradlew
         working-directory: src/android
